@@ -131,6 +131,25 @@ pub struct ChannelMessage {
 pub use openfang_types::config::CHANNELS_WITH_PLATFORM_ID_AS_CHANNEL;
 
 impl ChannelMessage {
+    /// One-line summary of the message content for logging.
+    pub fn content_summary(&self) -> String {
+        match &self.content {
+            ChannelContent::Text(t) => {
+                if t.len() > 200 { format!("{}…", &t[..197]) } else { t.clone() }
+            }
+            ChannelContent::Command { name, args } => format!("/{name} {}", args.join(" ")),
+            ChannelContent::Image { url, .. } => format!("[image: {url}]"),
+            ChannelContent::File { filename, url, .. } => format!("[file: {filename} {url}]"),
+            ChannelContent::FileData { filename, .. } => format!("[file_data: {filename}]"),
+            ChannelContent::Voice { url, .. } => format!("[voice: {url}]"),
+            ChannelContent::Location { lat, lon } => format!("[location: {lat},{lon}]"),
+            ChannelContent::Multipart(parts) => {
+                format!("[multipart: {} parts]", parts.len())
+            }
+            ChannelContent::Card { .. } => "[interactive card]".to_string(),
+        }
+    }
+
     /// Return the platform-native channel/conversation ID for this message,
     /// suitable for matching against an `AgentBinding`'s `channel_id` field.
     ///

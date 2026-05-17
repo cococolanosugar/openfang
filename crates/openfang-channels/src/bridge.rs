@@ -780,6 +780,13 @@ async fn dispatch_message(
 ) {
     let ct_str = channel_type_str(&message.channel);
 
+    info!(
+        "[{ct_str}] message received: sender={} chat={} text={:?}",
+        message.sender.display_name,
+        message.sender.platform_id,
+        message.content_summary(),
+    );
+
     // Fetch per-channel overrides (if configured)
     let overrides = handle.channel_overrides(ct_str).await;
     let channel_default_format = default_output_format_for_channel(ct_str);
