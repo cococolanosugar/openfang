@@ -551,6 +551,10 @@ impl TelegramAdapter {
                     Box::pin(self.send_content(user, part, thread_id)).await?;
                 }
             }
+            ChannelContent::Card { .. } => {
+                self.api_send_message(chat_id, "(Unsupported content type)", thread_id)
+                    .await?;
+            }
         }
         Ok(())
     }

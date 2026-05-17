@@ -308,6 +308,23 @@ pub trait ChannelBridgeHandle: Send + Sync {
         "Schedules not available.".to_string()
     }
 
+    /// Send a message to an agent with optional phase callbacks for UX indicators.
+    ///
+    /// `on_phase` is called (synchronously, non-blocking) when the agent enters a
+    /// new lifecycle phase (ToolUse, Streaming). The caller can use this to send
+    /// lifecycle reactions or update progress UI cards.
+    /// Thinking/Done/Error are signaled via the return and are NOT sent through
+    /// the callback — the caller handles those explicitly.
+    async fn send_message_streaming(
+        &self,
+        agent_id: AgentId,
+        message: &str,
+        on_phase: Option<Arc<dyn Fn(AgentPhase, Option<String>) + Send + Sync>>,
+    ) -> Result<String, String> {
+        let _ = on_phase;
+        self.send_message(agent_id, message).await
+    }
+
     /// List pending approval requests as formatted text.
     async fn list_approvals_text(&self) -> String {
         "No approvals pending.".to_string()
@@ -639,11 +656,13 @@ async fn send_lifecycle_reaction(
     user: &ChannelUser,
     message_id: &str,
     phase: AgentPhase,
+    detail: Option<String>,
 ) {
     let reaction = LifecycleReaction {
         emoji: default_phase_emoji(&phase).to_string(),
         phase,
         remove_previous: true,
+        detail,
     };
     let _ = adapter.send_reaction(user, message_id, &reaction).await;
 }
@@ -952,6 +971,12 @@ async fn dispatch_message(
                         provider_metadata: None,
                     });
                 }
+                ChannelContent::Card { .. } => {
+                    blocks.push(ContentBlock::Text {
+                        text: "[Interactive card]".to_string(),
+                        provider_metadata: None,
+                    });
+                }
                 // Defensive: debug_assert above catches this in dev; ignore
                 // gracefully in release.
                 ChannelContent::Multipart(_) => {}
@@ -1052,6 +1077,9 @@ async fn dispatch_message(
         ChannelContent::FileData { ref filename, .. } => {
             format!("[User sent a local file: {filename}]")
         }
+        ChannelContent::Card { .. } => {
+            "[Interactive card]".to_string()
+        }
         ChannelContent::Multipart(parts) => parts
             .iter()
             .map(|p| match p {
@@ -1076,6 +1104,7 @@ async fn dispatch_message(
                 ChannelContent::Command { name, args } => {
                     format!("/{name} {}", args.join(" "))
                 }
+                ChannelContent::Card { .. } => "[Interactive card]".to_string(),
                 // Nesting is rejected by adapters; emit empty so the join
                 // doesn't insert spurious separators.
                 ChannelContent::Multipart(_) => String::new(),
@@ -1297,8 +1326,8 @@ async fn dispatch_message(
     // Lifecycle reaction: ⏳ Queued → 🤔 Thinking → ✅ Done / ❌ Error
     let msg_id = &message.platform_message_id;
     if lifecycle_reactions {
-        send_lifecycle_reaction(adapter, &message.sender, msg_id, AgentPhase::Queued).await;
-        send_lifecycle_reaction(adapter, &message.sender, msg_id, AgentPhase::Thinking).await;
+        send_lifecycle_reaction(adapter, &message.sender, msg_id, AgentPhase::Queued, None).await;
+        send_lifecycle_reaction(adapter, &message.sender, msg_id, AgentPhase::Thinking, None).await;
     }
 
     // Continuous typing indicator — refreshes every 4s so platforms like Telegram
@@ -1330,8 +1359,34 @@ async fn dispatch_message(
         text.clone()
     };
 
-    // Send to agent and relay response
-    let result = handle.send_message(agent_id, &prefixed_text).await;
+    // Send to agent and relay response.
+    // Use streaming when lifecycle reactions are enabled so we can capture
+    // ToolUse and Streaming phases for UX cards (e.g. Feishu status card).
+    let result = if lifecycle_reactions {
+        let adapter_arc = adapter_arc.clone();
+        let user = message.sender.clone();
+        let mid = msg_id.clone();
+        let on_phase: Arc<dyn Fn(AgentPhase, Option<String>) + Send + Sync> =
+            Arc::new(move |phase, detail| {
+                let a = adapter_arc.clone();
+                let u = user.clone();
+                let m = mid.clone();
+                tokio::spawn(async move {
+                    let reaction = LifecycleReaction {
+                        emoji: default_phase_emoji(&phase).to_string(),
+                        phase,
+                        remove_previous: true,
+                        detail,
+                    };
+                    let _ = a.send_reaction(&u, &m, &reaction).await;
+                });
+            });
+        handle
+            .send_message_streaming(agent_id, &prefixed_text, Some(on_phase))
+            .await
+    } else {
+        handle.send_message(agent_id, &prefixed_text).await
+    };
 
     // Stop the typing refresh now that we have a response
     typing_task.abort();
@@ -1339,7 +1394,8 @@ async fn dispatch_message(
     match result {
         Ok(response) => {
             if lifecycle_reactions {
-                send_lifecycle_reaction(adapter, &message.sender, msg_id, AgentPhase::Done).await;
+                send_lifecycle_reaction(adapter, &message.sender, msg_id, AgentPhase::Done, None)
+                    .await;
             }
             let response =
                 maybe_prefix_response(handle, overrides.as_ref(), agent_id, response).await;
@@ -1369,6 +1425,7 @@ async fn dispatch_message(
                                 &message.sender,
                                 msg_id,
                                 AgentPhase::Done,
+                                None,
                             )
                             .await;
                         }
@@ -1389,17 +1446,18 @@ async fn dispatch_message(
                             .await;
                     }
                     Err(e2) => {
+                        let err_msg = sanitize_agent_error(&e2.to_string());
+                        warn!("Agent error after re-resolution for {new_id}: {e2}");
                         if lifecycle_reactions {
                             send_lifecycle_reaction(
                                 adapter,
                                 &message.sender,
                                 msg_id,
                                 AgentPhase::Error,
+                                Some(err_msg.clone()),
                             )
                             .await;
                         }
-                        warn!("Agent error after re-resolution for {new_id}: {e2}");
-                        let err_msg = sanitize_agent_error(&e2.to_string());
                         if !adapter.suppress_error_responses() {
                             send_response(
                                 adapter,
@@ -1425,11 +1483,11 @@ async fn dispatch_message(
                 return;
             }
 
-            if lifecycle_reactions {
-                send_lifecycle_reaction(adapter, &message.sender, msg_id, AgentPhase::Error).await;
-            }
-            warn!("Agent error for {agent_id}: {e}");
             let err_msg = sanitize_agent_error(&e.to_string());
+            warn!("Agent error for {agent_id}: {e}");
+            if lifecycle_reactions {
+                send_lifecycle_reaction(adapter, &message.sender, msg_id, AgentPhase::Error, Some(err_msg.clone())).await;
+            }
             if !adapter.suppress_error_responses() {
                 send_response(
                     adapter,
@@ -1777,16 +1835,49 @@ async fn dispatch_with_blocks(
     // Lifecycle reaction: ⏳ Queued → 🤔 Thinking → ✅ Done / ❌ Error
     let msg_id = &message.platform_message_id;
     if lifecycle_reactions {
-        send_lifecycle_reaction(adapter, &message.sender, msg_id, AgentPhase::Queued).await;
-        send_lifecycle_reaction(adapter, &message.sender, msg_id, AgentPhase::Thinking).await;
+        send_lifecycle_reaction(adapter, &message.sender, msg_id, AgentPhase::Queued, None).await;
+        send_lifecycle_reaction(adapter, &message.sender, msg_id, AgentPhase::Thinking, None).await;
     }
 
     // Continuous typing indicator (see spawn_typing_loop doc)
     let typing_task = spawn_typing_loop(adapter_arc.clone(), message.sender.clone());
 
-    let result = handle
-        .send_message_with_blocks(agent_id, blocks.clone())
-        .await;
+    // Use streaming when lifecycle reactions are enabled to capture ToolUse/Streaming.
+    let result = if lifecycle_reactions {
+        let adapter_arc = adapter_arc.clone();
+        let user = message.sender.clone();
+        let mid = msg_id.clone();
+        let on_phase: Arc<dyn Fn(AgentPhase, Option<String>) + Send + Sync> =
+            Arc::new(move |phase, detail| {
+                let a = adapter_arc.clone();
+                let u = user.clone();
+                let m = mid.clone();
+                tokio::spawn(async move {
+                    let reaction = LifecycleReaction {
+                        emoji: default_phase_emoji(&phase).to_string(),
+                        phase,
+                        remove_previous: true,
+                        detail,
+                    };
+                    let _ = a.send_reaction(&u, &m, &reaction).await;
+                });
+            });
+        let text: String = blocks
+            .iter()
+            .filter_map(|b| match b {
+                ContentBlock::Text { text, .. } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        handle
+            .send_message_streaming(agent_id, &text, Some(on_phase))
+            .await
+    } else {
+        handle
+            .send_message_with_blocks(agent_id, blocks.clone())
+            .await
+    };
 
     typing_task.abort();
 
@@ -1801,7 +1892,8 @@ async fn dispatch_with_blocks(
     match result {
         Ok(response) => {
             if lifecycle_reactions {
-                send_lifecycle_reaction(adapter, &message.sender, msg_id, AgentPhase::Done).await;
+                send_lifecycle_reaction(adapter, &message.sender, msg_id, AgentPhase::Done, None)
+                    .await;
             }
             let response = match &prefix_name {
                 Some(name) => apply_agent_prefix(prefix_style, name, &response),
@@ -1833,6 +1925,7 @@ async fn dispatch_with_blocks(
                                 &message.sender,
                                 msg_id,
                                 AgentPhase::Done,
+                                None,
                             )
                             .await;
                         }
@@ -1859,17 +1952,18 @@ async fn dispatch_with_blocks(
                             .await;
                     }
                     Err(e2) => {
+                        let err_msg = sanitize_agent_error(&e2.to_string());
+                        warn!("Agent error after re-resolution for {new_id}: {e2}");
                         if lifecycle_reactions {
                             send_lifecycle_reaction(
                                 adapter,
                                 &message.sender,
                                 msg_id,
                                 AgentPhase::Error,
+                                Some(err_msg.clone()),
                             )
                             .await;
                         }
-                        warn!("Agent error after re-resolution for {new_id}: {e2}");
-                        let err_msg = sanitize_agent_error(&e2.to_string());
                         if !adapter.suppress_error_responses() {
                             send_response(
                                 adapter,
@@ -1895,11 +1989,11 @@ async fn dispatch_with_blocks(
                 return;
             }
 
-            if lifecycle_reactions {
-                send_lifecycle_reaction(adapter, &message.sender, msg_id, AgentPhase::Error).await;
-            }
-            warn!("Agent error for {agent_id}: {e}");
             let err_msg = sanitize_agent_error(&e.to_string());
+            warn!("Agent error for {agent_id}: {e}");
+            if lifecycle_reactions {
+                send_lifecycle_reaction(adapter, &message.sender, msg_id, AgentPhase::Error, Some(err_msg.clone())).await;
+            }
             if !adapter.suppress_error_responses() {
                 send_response(
                     adapter,

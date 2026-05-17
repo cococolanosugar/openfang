@@ -86,6 +86,19 @@ pub enum ChannelContent {
     /// content blocks. Implementations should not produce nested `Multipart`
     /// values; consumers may `debug_assert!` against nesting.
     Multipart(Vec<ChannelContent>),
+    /// A platform-native interactive card message (e.g. Feishu `interactive`,
+    /// Slack Block Kit, Teams Adaptive Card). The `payload` is the raw JSON
+    /// body expected by the platform API. Adapters that do not support cards
+    /// fall back to `(Unsupported content type)`.
+    ///
+    /// `card_id` is an optional platform message ID used to update/replace
+    /// an existing card (e.g. after an approval decision). Only the adapter
+    /// that originally sent the card will have context to update it.
+    Card {
+        payload: serde_json::Value,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        card_id: Option<String>,
+    },
 }
 
 /// A unified message from any channel.
@@ -207,6 +220,9 @@ pub struct LifecycleReaction {
     pub emoji: String,
     /// Whether to remove the previous phase reaction.
     pub remove_previous: bool,
+    /// Optional detail text (error message, tool description, etc.).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub detail: Option<String>,
 }
 
 /// Hardcoded emoji allowlist for lifecycle reactions.
@@ -492,11 +508,38 @@ mod tests {
             lat: 40.7128,
             lon: -74.0060,
         };
+        let card = ChannelContent::Card {
+            payload: serde_json::json!({
+                "header": { "title": { "tag": "plain_text", "content": "Approval" } },
+                "elements": []
+            }),
+            card_id: Some("om_abc123".to_string()),
+        };
 
         // Just verify they serialize without panic
         serde_json::to_string(&text).unwrap();
         serde_json::to_string(&cmd).unwrap();
         serde_json::to_string(&loc).unwrap();
+        let card_json = serde_json::to_string(&card).unwrap();
+        assert!(card_json.contains("Approval"));
+        assert!(card_json.contains("om_abc123"));
+    }
+
+    #[test]
+    fn test_channel_content_card_roundtrip() {
+        let card = ChannelContent::Card {
+            payload: serde_json::json!({"header": {"title": {"content": "test"}}}),
+            card_id: None,
+        };
+        let json = serde_json::to_string(&card).unwrap();
+        let back: ChannelContent = serde_json::from_str(&json).unwrap();
+        match back {
+            ChannelContent::Card { payload, card_id } => {
+                assert_eq!(payload["header"]["title"]["content"], "test");
+                assert!(card_id.is_none());
+            }
+            _ => panic!("Expected Card variant"),
+        }
     }
 
     // ----- AgentPhase tests -----

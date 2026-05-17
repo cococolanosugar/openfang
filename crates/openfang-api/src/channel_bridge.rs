@@ -4,6 +4,7 @@
 //! `start_channel_bridge()` entry point called by the daemon.
 
 use openfang_channels::bridge::{BridgeManager, ChannelBridgeHandle};
+use openfang_channels::types::AgentPhase;
 use openfang_channels::discord::DiscordAdapter;
 use openfang_channels::email::EmailAdapter;
 use openfang_channels::google_chat::GoogleChatAdapter;
@@ -108,6 +109,60 @@ impl ChannelBridgeHandle for KernelBridgeAdapter {
             .send_message_with_blocks(agent_id, &text, blocks)
             .await
             .map_err(|e| format!("{e}"))?;
+        Ok(result.response)
+    }
+
+    async fn send_message_streaming(
+        &self,
+        agent_id: AgentId,
+        message: &str,
+        on_phase: Option<Arc<dyn Fn(AgentPhase, Option<String>) + Send + Sync>>,
+    ) -> Result<String, String> {
+        let on_phase = match on_phase {
+            Some(cb) => cb,
+            None => return self.send_message(agent_id, message).await,
+        };
+
+        let (mut rx, join_handle) = self
+            .kernel
+            .send_message_streaming(
+                agent_id,
+                message,
+                None, // kernel_handle
+                None, // sender_id
+                None, // sender_name
+                None, // content_blocks
+            )
+            .map_err(|e| format!("{e}"))?;
+
+        // Drain the stream, forwarding ToolUse/Streaming phases to on_phase.
+        // The stream closes when the agent loop finishes (sender dropped).
+        // We intentionally skip PhaseChange("tool_use") — it fires before the
+        // LLM has produced the tool arguments.  ToolUseEnd carries the parsed
+        // input, so we format a Hermes-style detail string from that.
+        while let Some(event) = rx.recv().await {
+            match event {
+                openfang_runtime::llm_driver::StreamEvent::ToolUseEnd { name, input, .. } => {
+                    let detail = fmt_tool_detail(&name, &input);
+                    on_phase(AgentPhase::tool_use(&name), Some(detail));
+                }
+                openfang_runtime::llm_driver::StreamEvent::PhaseChange { phase, detail: _ }
+                    if phase.as_str() == "streaming" =>
+                {
+                    on_phase(AgentPhase::Streaming, None);
+                }
+                _ => {}
+            }
+        }
+
+        let result = join_handle
+            .await
+            .map_err(|e| format!("Agent task panicked: {e}"))?
+            .map_err(|e| format!("{e}"))?;
+
+        if result.silent {
+            return Ok(String::new());
+        }
         Ok(result.response)
     }
 
@@ -1014,6 +1069,41 @@ impl ChannelBridgeHandle for KernelBridgeAdapter {
             }
         }
         msg
+    }
+}
+
+/// Format a tool invocation for display (Hermes-style: `tool_name` — "arg").
+///
+/// Extracts the most informative field from the tool's input JSON and produces a
+/// one-line summary suitable for a progress text message.
+fn fmt_tool_detail(name: &str, input: &serde_json::Value) -> String {
+    // Priority-ordered list of "interesting" fields to show
+    let primary_fields = [
+        "command", "path", "file_path", "query", "pattern", "url", "message", "text", "content",
+    ];
+    let preview = input
+        .as_object()
+        .and_then(|obj| {
+            for key in &primary_fields {
+                if let Some(v) = obj.get(*key).and_then(|v| v.as_str()) {
+                    let v = if v.len() > 120 { &v[..117] } else { v };
+                    return Some(format!("\"{v}\""));
+                }
+            }
+            // Fallback: first string value
+            obj.iter()
+                .filter_map(|(_, v)| v.as_str())
+                .next()
+                .map(|s| {
+                    let s = if s.len() > 120 { &s[..117] } else { s };
+                    format!("\"{s}\"")
+                })
+        })
+        .unwrap_or_default();
+    if preview.is_empty() {
+        format!("`{name}`")
+    } else {
+        format!("`{name}` ⟶ {preview}")
     }
 }
 

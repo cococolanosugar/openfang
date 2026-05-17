@@ -1,4 +1,4 @@
-//! Feishu/Lark Open Platform channel adapter.
+﻿//! Feishu/Lark Open Platform channel adapter.
 //!
 //! Supports both regions via the `region` parameter:
 //! - **CN** (Feishu domestic): `open.feishu.cn`
@@ -14,7 +14,8 @@
 //! - WebSocket mode: Long connection receives events (no public IP required)
 
 use crate::types::{
-    split_message, ChannelAdapter, ChannelContent, ChannelMessage, ChannelType, ChannelUser,
+    split_message, AgentPhase, ChannelAdapter, ChannelContent, ChannelMessage, ChannelType,
+    ChannelUser, LifecycleReaction,
 };
 use async_trait::async_trait;
 use chrono::Utc;
@@ -22,7 +23,7 @@ use futures::{SinkExt, Stream, StreamExt};
 use prost::Message as ProstMessage;
 use std::collections::HashMap;
 use std::pin::Pin;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tokio::sync::{mpsc, watch, RwLock};
 use tokio_tungstenite::{connect_async, tungstenite::protocol::Message};
@@ -217,6 +218,12 @@ pub struct FeishuAdapter {
     message_dedup: Arc<DedupCache>,
     /// Event deduplication cache.
     event_dedup: Arc<DedupCache>,
+    /// Status card tracking: (chat_id, user_message_id) → status_card_message_id.
+    status_cards: Mutex<HashMap<(String, String), String>>,
+    /// LRU-style cache of pending reaction IDs keyed by (chat_id, message_id).
+    /// Stored so we can delete the old reaction without a LIST call on every phase
+    /// transition (Hermes-style: reaction is only added once, then removed/replaced).
+    pending_reactions: Mutex<HashMap<(String, String), String>>,
 }
 
 impl FeishuAdapter {
@@ -239,6 +246,8 @@ impl FeishuAdapter {
             cached_token: Arc::new(RwLock::new(None)),
             message_dedup: Arc::new(DedupCache::new(DEDUP_CACHE_SIZE)),
             event_dedup: Arc::new(DedupCache::new(DEDUP_CACHE_SIZE)),
+            status_cards: Mutex::new(HashMap::new()),
+            pending_reactions: Mutex::new(HashMap::new()),
         }
     }
 
@@ -297,6 +306,8 @@ impl FeishuAdapter {
             cached_token: Arc::new(RwLock::new(None)),
             message_dedup: Arc::new(DedupCache::new(DEDUP_CACHE_SIZE)),
             event_dedup: Arc::new(DedupCache::new(DEDUP_CACHE_SIZE)),
+            status_cards: Mutex::new(HashMap::new()),
+            pending_reactions: Mutex::new(HashMap::new()),
         }
     }
 
@@ -473,6 +484,252 @@ impl FeishuAdapter {
         }
 
         Ok(())
+    }
+
+    /// Send an interactive card message.
+    ///
+    /// Returns the `message_id` of the sent card (used for later updates).
+    /// The `card_json` should be the full card body as documented in
+    /// https://open.feishu.cn/document/common-capabilities/message-card/overview
+    async fn api_send_card(
+        &self,
+        receive_id: &str,
+        receive_id_type: &str,
+        card_json: &serde_json::Value,
+    ) -> Result<String, Box<dyn std::error::Error>> {
+        let token = self.get_token().await?;
+        let url = format!(
+            "{}?receive_id_type={}",
+            self.api_url("/open-apis/im/v1/messages"),
+            receive_id_type
+        );
+
+        let body = serde_json::json!({
+            "receive_id": receive_id,
+            "msg_type": "interactive",
+            "content": card_json.to_string(),
+        });
+
+        let resp = self
+            .client
+            .post(&url)
+            .bearer_auth(&token)
+            .json(&body)
+            .send()
+            .await?;
+
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let resp_body = resp.text().await.unwrap_or_default();
+            return Err(format!(
+                "{} send card error {status}: {resp_body}",
+                self.region.label()
+            )
+            .into());
+        }
+
+        let resp_body: serde_json::Value = resp.json().await?;
+        let code = resp_body["code"].as_i64().unwrap_or(-1);
+        if code != 0 {
+            let msg = resp_body["msg"].as_str().unwrap_or("unknown error");
+            return Err(format!("{} send card API error {code}: {msg}", self.region.label()).into());
+        }
+
+        let message_id = resp_body["data"]["message_id"]
+            .as_str()
+            .unwrap_or("")
+            .to_string();
+        Ok(message_id)
+    }
+
+    /// Update an existing card message (e.g. after an approval decision).
+    ///
+    /// Uses PATCH /open-apis/im/v1/messages/{message_id} with msg_type=interactive.
+    async fn api_update_card(
+        &self,
+        message_id: &str,
+        card_json: &serde_json::Value,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let token = self.get_token().await?;
+        let url = self.api_url(&format!("/open-apis/im/v1/messages/{}", message_id));
+
+        let body = serde_json::json!({
+            "msg_type": "interactive",
+            "content": card_json.to_string(),
+        });
+
+        let resp = self
+            .client
+            .patch(&url)
+            .bearer_auth(&token)
+            .json(&body)
+            .send()
+            .await?;
+
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let resp_body = resp.text().await.unwrap_or_default();
+            return Err(format!(
+                "{} update card error {status}: {resp_body}",
+                self.region.label()
+            )
+            .into());
+        }
+
+        let resp_body: serde_json::Value = resp.json().await?;
+        let code = resp_body["code"].as_i64().unwrap_or(-1);
+        if code != 0 {
+            let msg = resp_body["msg"].as_str().unwrap_or("unknown error");
+            warn!("{}: update card API error {code}: {msg}", self.region.label());
+            return Err(format!(
+                "{} update card API error {code}: {msg}",
+                self.region.label()
+            )
+            .into());
+        }
+
+        Ok(())
+    }
+
+    /// Add an emoji reaction to a message.
+    ///
+    /// Returns the reaction `reaction_id` on success (used to delete later).
+    /// Silently returns `None` if the emoji type is unsupported or the API call fails.
+    async fn api_add_reaction(
+        &self,
+        message_id: &str,
+        emoji_type: &str,
+    ) -> Option<String> {
+        let token = match self.get_token().await {
+            Ok(t) => t,
+            Err(e) => {
+                warn!("{}: failed to get token for reaction: {e}", self.region.label());
+                return None;
+            }
+        };
+        let url = self.api_url(&format!(
+            "/open-apis/im/v1/messages/{}/reactions",
+            message_id
+        ));
+        let body = serde_json::json!({
+            "reaction_type": { "emoji_type": emoji_type }
+        });
+
+        let resp = match self
+            .client
+            .post(&url)
+            .bearer_auth(&token)
+            .json(&body)
+            .send()
+            .await
+        {
+            Ok(r) => r,
+            Err(e) => {
+                debug!("{}: reaction API request failed: {e}", self.region.label());
+                return None;
+            }
+        };
+
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let body_text = resp.text().await.unwrap_or_default();
+            debug!(
+                "{}: add reaction failed ({status}): {body_text}",
+                self.region.label()
+            );
+            return None;
+        }
+
+        let resp_body: serde_json::Value = match resp.json().await {
+            Ok(b) => b,
+            Err(_) => return None,
+        };
+        let code = resp_body["code"].as_i64().unwrap_or(-1);
+        if code != 0 {
+            let msg = resp_body["msg"].as_str().unwrap_or("unknown");
+            debug!("{}: add reaction API error {code}: {msg}", self.region.label());
+            return None;
+        }
+
+        resp_body["data"]["reaction_id"]
+            .as_str()
+            .map(String::from)
+    }
+
+    /// Delete a specific reaction from a message by its reaction_id.
+    async fn api_delete_reaction(
+        &self,
+        message_id: &str,
+        reaction_id: &str,
+    ) -> bool {
+        let token = match self.get_token().await {
+            Ok(t) => t,
+            Err(e) => {
+                warn!("{}: failed to get token for delete reaction: {e}", self.region.label());
+                return false;
+            }
+        };
+        let url = self.api_url(&format!(
+            "/open-apis/im/v1/messages/{}/reactions/{}",
+            message_id, reaction_id
+        ));
+
+        let resp = match self.client.delete(&url).bearer_auth(&token).send().await {
+            Ok(r) => r,
+            Err(e) => {
+                debug!("{}: delete reaction API request failed: {e}", self.region.label());
+                return false;
+            }
+        };
+
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let body_text = resp.text().await.unwrap_or_default();
+            debug!(
+                "{}: delete reaction failed ({status}): {body_text}",
+                self.region.label()
+            );
+            return false;
+        }
+
+        let resp_body: serde_json::Value = match resp.json().await {
+            Ok(b) => b,
+            Err(_) => return false,
+        };
+        let code = resp_body["code"].as_i64().unwrap_or(-1);
+        code == 0
+    }
+
+    /// Create or update the in-progress status card for a given (chat, message) key.
+    async fn upsert_status_card(
+        &self,
+        key: &(String, String),
+        receive_id: &str,
+        reaction: &LifecycleReaction,
+    ) {
+        let card = build_status_card(&reaction.phase, reaction.detail.as_deref());
+        let existing = self.status_cards.lock().unwrap().get(key).cloned();
+        if let Some(card_id) = existing {
+            let _ = self.api_update_card(&card_id, &card).await;
+        } else {
+            match self.api_send_card(receive_id, "chat_id", &card).await {
+                Ok(card_id) if !card_id.is_empty() => {
+                    self.status_cards.lock().unwrap().insert(key.clone(), card_id);
+                }
+                Ok(_) => {
+                    warn!(
+                        "{}: send status card returned empty message_id",
+                        self.region.label()
+                    );
+                }
+                Err(e) => {
+                    warn!(
+                        "{}: failed to send status card: {e}",
+                        self.region.label()
+                    );
+                }
+            }
+        }
     }
 
     /// Start webhook server (Webhook mode).
@@ -1188,6 +1445,105 @@ fn should_respond_in_group(text: &str, mentions: &serde_json::Value, bot_names: 
     false
 }
 
+// ─── Reaction emoji mapping ───────────────────────────────────────────────
+
+/// Map a Unicode emoji (from `default_phase_emoji`) to a Feishu reaction emoji_type.
+///
+/// Feishu's reaction API uses its own emoji type strings rather than raw Unicode.
+/// See: https://open.feishu.cn/document/server-docs/im-v1/message-reaction/emojis-introduce
+fn emoji_to_feishu_reaction_type(emoji: &str) -> Option<&'static str> {
+    match emoji {
+        // ⏳ Queued
+        "\u{23F3}" => Some("HOURGLASS"),
+        // 🤔 Thinking
+        "\u{1F914}" => Some("THINKING"),
+        // ⚙️ ToolUse
+        "\u{2699}\u{FE0F}" => Some("GEAR"),
+        // ✍️ Streaming
+        "\u{270D}\u{FE0F}" => Some("WRITING"),
+        // ✅ Done
+        "\u{2705}" => Some("DONE"),
+        // ❌ Error
+        "\u{274C}" => Some("CROSS"),
+        // 🔄 Processing
+        "\u{1F504}" => Some("ARROWS_COUNTERCLOCKWISE"),
+        // 👀 Looking
+        "\u{1F440}" => Some("EYES"),
+        _ => None,
+    }
+}
+
+/// Build a Feishu interactive card that shows the agent's current lifecycle phase.
+///
+/// Returns the full card JSON body as expected by the `interactive` message API.
+/// The card is updated in-place as the agent progresses through its lifecycle.
+///
+/// `detail` is optional context displayed in the card body — an error message, a
+/// tool description, or other progress information visible to the waiting user.
+fn build_status_card(phase: &AgentPhase, detail: Option<&str>) -> serde_json::Value {
+    let (title, template) = match phase {
+        AgentPhase::Queued => ("⏳ Waiting for agent...", "wathet"),
+        AgentPhase::Thinking => ("🤔 Thinking...", "wathet"),
+        AgentPhase::ToolUse { tool_name } => {
+            let subtitle = if tool_name.len() > 60 {
+                format!("`{}...`", &tool_name[..57])
+            } else {
+                format!("`{tool_name}`")
+            };
+            let mut card = serde_json::json!({
+                "config": { "wide_screen_mode": true },
+                "header": {
+                    "title": { "tag": "plain_text", "content": "⚙️ Running tool" },
+                    "template": "yellow"
+                },
+                "elements": [{
+                    "tag": "markdown",
+                    "content": subtitle
+                }]
+            });
+            if let Some(d) = detail {
+                if let Some(arr) = card["elements"].as_array_mut() {
+                    arr.push(serde_json::json!({
+                        "tag": "markdown",
+                        "content": d
+                    }));
+                }
+            }
+            return card;
+        }
+        AgentPhase::Streaming => ("✍️ Writing response...", "yellow"),
+        AgentPhase::Done => ("✅ Done", "green"),
+        AgentPhase::Error => ("❌ Error", "red"),
+    };
+
+    let mut elements = Vec::new();
+    if let Some(d) = detail {
+        elements.push(serde_json::json!({
+            "tag": "markdown",
+            "content": d
+        }));
+    }
+
+    if elements.is_empty() {
+        serde_json::json!({
+            "config": { "wide_screen_mode": true },
+            "header": {
+                "title": { "tag": "plain_text", "content": title },
+                "template": template
+            }
+        })
+    } else {
+        serde_json::json!({
+            "config": { "wide_screen_mode": true },
+            "header": {
+                "title": { "tag": "plain_text", "content": title },
+                "template": template
+            },
+            "elements": elements
+        })
+    }
+}
+
 /// Strip @mention placeholders from text (`@_user_N` format).
 fn strip_mention_placeholders(text: &str) -> String {
     match regex_lite::Regex::new(r"@_user_\d+\s*") {
@@ -1390,6 +1746,10 @@ impl ChannelAdapter for FeishuAdapter {
                 self.api_send_message(&user.platform_id, "chat_id", &text)
                     .await?;
             }
+            ChannelContent::Card { payload, .. } => {
+                self.api_send_card(&user.platform_id, "chat_id", &payload)
+                    .await?;
+            }
             _ => {
                 self.api_send_message(&user.platform_id, "chat_id", "(Unsupported content type)")
                     .await?;
@@ -1399,6 +1759,91 @@ impl ChannelAdapter for FeishuAdapter {
     }
 
     async fn send_typing(&self, _user: &ChannelUser) -> Result<(), Box<dyn std::error::Error>> {
+        Ok(())
+    }
+
+    /// Hermes-style reaction discipline for Feishu:
+    ///
+    /// Feishu reactions render as prominent badges (unlike Telegram's small footer
+    /// emoji). Showing one badge per lifecycle phase creates noise. Instead we only
+    /// mark *start* (Thinking) and *failure* (CrossMark); success is implicit — the
+    /// reply itself is the signal. Progress details (tool names, error messages) go
+    /// into a status **card** that is updated in-place.
+    ///
+    /// Phase → behavior:
+    ///   Queued   → create card (may flash briefly)
+    ///   Thinking → add THINKING reaction + create status card
+    ///   ToolUse  → send text message with tool detail (Hermes-style chain)
+    ///   Stream   → no-op (the eventual response covers this)
+    ///   Done     → delete cached reaction + remove status card
+    ///   Error    → delete cached reaction, add CROSS + update card with error
+    async fn send_reaction(
+        &self,
+        user: &ChannelUser,
+        message_id: &str,
+        reaction: &LifecycleReaction,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let key = (user.platform_id.clone(), message_id.to_string());
+
+        match &reaction.phase {
+            // ─── Start: single reaction as processing indicator ──────
+            AgentPhase::Thinking => {
+                if let Some(emoji_type) = emoji_to_feishu_reaction_type(&reaction.emoji) {
+                    if let Some(reaction_id) =
+                        self.api_add_reaction(message_id, emoji_type).await
+                    {
+                        self.pending_reactions
+                            .lock()
+                            .unwrap()
+                            .insert(key.clone(), reaction_id);
+                    }
+                }
+                self.upsert_status_card(&key, &user.platform_id, reaction)
+                    .await;
+            }
+
+            // ─── Tool execution: text message (Hermes-style chain) ──
+            AgentPhase::ToolUse { .. } => {
+                if let Some(detail) = &reaction.detail {
+                    let _ = self
+                        .api_send_message(&user.platform_id, "chat_id", detail)
+                        .await;
+                }
+            }
+
+            // ─── Streaming: no-op (the final response text is enough) ─
+            AgentPhase::Streaming => {}
+
+            // ─── Success: remove reaction, finalize card ────────────
+            AgentPhase::Done => {
+                let old_id = self.pending_reactions.lock().unwrap().remove(&key);
+                if let Some(old_id) = old_id {
+                    self.api_delete_reaction(message_id, &old_id).await;
+                }
+                let card_id = self.status_cards.lock().unwrap().remove(&key);
+                if let Some(card_id) = card_id {
+                    let card = build_status_card(&reaction.phase, reaction.detail.as_deref());
+                    let _ = self.api_update_card(&card_id, &card).await;
+                }
+            }
+
+            // ─── Failure: replace with CrossMark, show error ────────
+            AgentPhase::Error => {
+                let old_id = self.pending_reactions.lock().unwrap().remove(&key);
+                if let Some(old_id) = old_id {
+                    self.api_delete_reaction(message_id, &old_id).await;
+                }
+                // CrossMark is always available — use it directly.
+                self.api_add_reaction(message_id, "CROSS").await;
+                // Update card with error detail, or create one if missing.
+                self.upsert_status_card(&key, &user.platform_id, reaction)
+                    .await;
+            }
+
+            // ─── Queued: no-op (Thinking fires immediately after) ───
+            AgentPhase::Queued => {}
+        }
+
         Ok(())
     }
 
@@ -1584,6 +2029,28 @@ mod tests {
     fn test_extract_text_from_post_empty() {
         let content = serde_json::json!({});
         assert!(extract_text_from_post(&content).is_none());
+    }
+
+    // ─── Reaction emoji mapping tests ────────────────────────────────────
+
+    #[test]
+    fn test_emoji_to_feishu_reaction_type_all_phases() {
+        // All ALLOWED_REACTION_EMOJI should have a mapping
+        assert_eq!(emoji_to_feishu_reaction_type("\u{23F3}"), Some("HOURGLASS"));       // ⏳ Queued
+        assert_eq!(emoji_to_feishu_reaction_type("\u{1F914}"), Some("THINKING"));       // 🤔 Thinking
+        assert_eq!(emoji_to_feishu_reaction_type("\u{2699}\u{FE0F}"), Some("GEAR"));   // ⚙️ ToolUse
+        assert_eq!(emoji_to_feishu_reaction_type("\u{270D}\u{FE0F}"), Some("WRITING")); // ✍️ Streaming
+        assert_eq!(emoji_to_feishu_reaction_type("\u{2705}"), Some("DONE"));            // ✅ Done
+        assert_eq!(emoji_to_feishu_reaction_type("\u{274C}"), Some("CROSS"));           // ❌ Error
+        assert_eq!(emoji_to_feishu_reaction_type("\u{1F504}"), Some("ARROWS_COUNTERCLOCKWISE")); // 🔄
+        assert_eq!(emoji_to_feishu_reaction_type("\u{1F440}"), Some("EYES"));           // 👀
+    }
+
+    #[test]
+    fn test_emoji_to_feishu_reaction_type_unknown() {
+        assert_eq!(emoji_to_feishu_reaction_type("🎉"), None);
+        assert_eq!(emoji_to_feishu_reaction_type(""), None);
+        assert_eq!(emoji_to_feishu_reaction_type("👍"), None);
     }
 
     // ─── Mention stripping tests ────────────────────────────────────────
