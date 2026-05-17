@@ -185,6 +185,9 @@ impl DedupCache {
 
 /// Feishu/Lark Open Platform adapter.
 ///
+/// (chat_id, user_message_id) → (card_message_id, log_lines)
+type ProgressLogMap = HashMap<(String, String), (String, Vec<String>)>;
+
 /// Inbound messages arrive via a webhook HTTP server or WebSocket long connection.
 /// Outbound messages are sent via the IM API
 /// with a tenant access token for authentication.
@@ -218,11 +221,13 @@ pub struct FeishuAdapter {
     message_dedup: Arc<DedupCache>,
     /// Event deduplication cache.
     event_dedup: Arc<DedupCache>,
-    /// Status card tracking: (chat_id, user_message_id) → status_card_message_id.
-    status_cards: Mutex<HashMap<(String, String), String>>,
+    /// Progress-log card tracking.
+    /// We use a Feishu interactive card as an editable "terminal log" — each tool
+    /// call appends a line via PATCH, so the user sees a single growing message
+    /// rather than scattered one-liners.
+    progress_msgs: Mutex<ProgressLogMap>,
+
     /// LRU-style cache of pending reaction IDs keyed by (chat_id, message_id).
-    /// Stored so we can delete the old reaction without a LIST call on every phase
-    /// transition (Hermes-style: reaction is only added once, then removed/replaced).
     pending_reactions: Mutex<HashMap<(String, String), String>>,
 }
 
@@ -246,7 +251,7 @@ impl FeishuAdapter {
             cached_token: Arc::new(RwLock::new(None)),
             message_dedup: Arc::new(DedupCache::new(DEDUP_CACHE_SIZE)),
             event_dedup: Arc::new(DedupCache::new(DEDUP_CACHE_SIZE)),
-            status_cards: Mutex::new(HashMap::new()),
+            progress_msgs: Mutex::new(HashMap::new()),
             pending_reactions: Mutex::new(HashMap::new()),
         }
     }
@@ -306,7 +311,7 @@ impl FeishuAdapter {
             cached_token: Arc::new(RwLock::new(None)),
             message_dedup: Arc::new(DedupCache::new(DEDUP_CACHE_SIZE)),
             event_dedup: Arc::new(DedupCache::new(DEDUP_CACHE_SIZE)),
-            status_cards: Mutex::new(HashMap::new()),
+            progress_msgs: Mutex::new(HashMap::new()),
             pending_reactions: Mutex::new(HashMap::new()),
         }
     }
@@ -700,33 +705,64 @@ impl FeishuAdapter {
         code == 0
     }
 
-    /// Create or update the in-progress status card for a given (chat, message) key.
-    async fn upsert_status_card(
+    /// Append a line to the progress-log card, creating it if it doesn't exist.
+    ///
+    /// We use a Feishu interactive card as an editable "terminal log" — the card
+    /// body is plain markdown, so it reads like a text message but supports PATCH
+    /// for in-place updates. Each tool call appends one line.
+    async fn append_progress_log(
         &self,
         key: &(String, String),
         receive_id: &str,
-        reaction: &LifecycleReaction,
+        line: String,
     ) {
-        let card = build_status_card(&reaction.phase, reaction.detail.as_deref());
-        let existing = self.status_cards.lock().unwrap().get(key).cloned();
-        if let Some(card_id) = existing {
-            let _ = self.api_update_card(&card_id, &card).await;
-        } else {
-            match self.api_send_card(receive_id, "chat_id", &card).await {
-                Ok(card_id) if !card_id.is_empty() => {
-                    self.status_cards.lock().unwrap().insert(key.clone(), card_id);
+        // Lock the map just long enough to read/update state, then drop it before
+        // any .await so the MutexGuard doesn't cross an await point.
+        enum Action {
+            UpdateCard { card_id: String, card: serde_json::Value },
+            SendNewCard { card: serde_json::Value, lines: Vec<String> },
+        }
+
+        let action = {
+            let mut map = self.progress_msgs.lock().unwrap();
+            if let Some((card_id, lines)) = map.get_mut(key) {
+                lines.push(line);
+                let card = build_progress_card(lines);
+                Action::UpdateCard {
+                    card_id: card_id.clone(),
+                    card,
                 }
-                Ok(_) => {
-                    warn!(
-                        "{}: send status card returned empty message_id",
-                        self.region.label()
-                    );
-                }
-                Err(e) => {
-                    warn!(
-                        "{}: failed to send status card: {e}",
-                        self.region.label()
-                    );
+            } else {
+                let lines = vec![line];
+                let card = build_progress_card(&lines);
+                Action::SendNewCard { card, lines }
+            }
+        };
+
+        match action {
+            Action::UpdateCard { card_id, card } => {
+                let _ = self.api_update_card(&card_id, &card).await;
+            }
+            Action::SendNewCard { card, lines } => {
+                match self.api_send_card(receive_id, "chat_id", &card).await {
+                    Ok(card_id) if !card_id.is_empty() => {
+                        self.progress_msgs
+                            .lock()
+                            .unwrap()
+                            .insert(key.clone(), (card_id, lines));
+                    }
+                    Ok(_) => {
+                        warn!(
+                            "{}: send progress card returned empty message_id",
+                            self.region.label()
+                        );
+                    }
+                    Err(e) => {
+                        warn!(
+                            "{}: failed to send progress card: {e}",
+                            self.region.label()
+                        );
+                    }
                 }
             }
         }
@@ -1473,75 +1509,20 @@ fn emoji_to_feishu_reaction_type(emoji: &str) -> Option<&'static str> {
     }
 }
 
-/// Build a Feishu interactive card that shows the agent's current lifecycle phase.
+/// Build a simple markdown card from accumulated log lines.
 ///
-/// Returns the full card JSON body as expected by the `interactive` message API.
-/// The card is updated in-place as the agent progresses through its lifecycle.
-///
-/// `detail` is optional context displayed in the card body — an error message, a
-/// tool description, or other progress information visible to the waiting user.
-fn build_status_card(phase: &AgentPhase, detail: Option<&str>) -> serde_json::Value {
-    let (title, template) = match phase {
-        AgentPhase::Queued => ("⏳ Waiting for agent...", "wathet"),
-        AgentPhase::Thinking => ("🤔 Thinking...", "wathet"),
-        AgentPhase::ToolUse { tool_name } => {
-            let subtitle = if tool_name.len() > 60 {
-                format!("`{}...`", &tool_name[..57])
-            } else {
-                format!("`{tool_name}`")
-            };
-            let mut card = serde_json::json!({
-                "config": { "wide_screen_mode": true },
-                "header": {
-                    "title": { "tag": "plain_text", "content": "⚙️ Running tool" },
-                    "template": "yellow"
-                },
-                "elements": [{
-                    "tag": "markdown",
-                    "content": subtitle
-                }]
-            });
-            if let Some(d) = detail {
-                if let Some(arr) = card["elements"].as_array_mut() {
-                    arr.push(serde_json::json!({
-                        "tag": "markdown",
-                        "content": d
-                    }));
-                }
-            }
-            return card;
-        }
-        AgentPhase::Streaming => ("✍️ Writing response...", "yellow"),
-        AgentPhase::Done => ("✅ Done", "green"),
-        AgentPhase::Error => ("❌ Error", "red"),
-    };
-
-    let mut elements = Vec::new();
-    if let Some(d) = detail {
-        elements.push(serde_json::json!({
+/// Used as an editable "terminal log" container — the card looks like a plain
+/// text message but supports PATCH-based in-place updates so we can append tool
+/// execution details one line at a time.
+fn build_progress_card(lines: &[String]) -> serde_json::Value {
+    let content = lines.join("\n");
+    serde_json::json!({
+        "config": { "wide_screen_mode": true },
+        "elements": [{
             "tag": "markdown",
-            "content": d
-        }));
-    }
-
-    if elements.is_empty() {
-        serde_json::json!({
-            "config": { "wide_screen_mode": true },
-            "header": {
-                "title": { "tag": "plain_text", "content": title },
-                "template": template
-            }
-        })
-    } else {
-        serde_json::json!({
-            "config": { "wide_screen_mode": true },
-            "header": {
-                "title": { "tag": "plain_text", "content": title },
-                "template": template
-            },
-            "elements": elements
-        })
-    }
+            "content": content
+        }]
+    })
 }
 
 /// Strip @mention placeholders from text (`@_user_N` format).
@@ -1768,15 +1749,23 @@ impl ChannelAdapter for FeishuAdapter {
     /// emoji). Showing one badge per lifecycle phase creates noise. Instead we only
     /// mark *start* (Thinking) and *failure* (CrossMark); success is implicit — the
     /// reply itself is the signal. Progress details (tool names, error messages) go
-    /// into a status **card** that is updated in-place.
+    /// Feishu reaction discipline (Hermes-style):
     ///
-    /// Phase → behavior:
-    ///   Queued   → create card (may flash briefly)
-    ///   Thinking → add THINKING reaction + create status card
-    ///   ToolUse  → send text message with tool detail (Hermes-style chain)
-    ///   Stream   → no-op (the eventual response covers this)
-    ///   Done     → delete cached reaction + remove status card
-    ///   Error    → delete cached reaction, add CROSS + update card with error
+    /// - Add ONE reaction (THINKING) as a processing indicator on the user's message.
+    /// - Build a single **progress-log card** (markdown, no fancy header) that is
+    ///   created on Thinking and appended to on each ToolUse.  Feishu's card API
+    ///   is the only message type that supports PATCH-based editing, so we use it
+    ///   as a "terminal log" container rather than a traditional UI card.
+    /// - On Done: delete the THINKING reaction, append "Done", and stop tracking.
+    /// - On Error: replace THINKING with CROSS, append the error detail.
+    ///
+    /// The result in the chat looks like:
+    /// ```
+    /// 🤔 Thinking...
+    /// `shell_exec` ⟶ "tail -n 50 /var/log/nginx/error.log"
+    /// `file_read` ⟶ "/etc/nginx/nginx.conf"
+    /// ✅ Done
+    /// ```
     async fn send_reaction(
         &self,
         user: &ChannelUser,
@@ -1786,7 +1775,6 @@ impl ChannelAdapter for FeishuAdapter {
         let key = (user.platform_id.clone(), message_id.to_string());
 
         match &reaction.phase {
-            // ─── Start: single reaction as processing indicator ──────
             AgentPhase::Thinking => {
                 if let Some(emoji_type) = emoji_to_feishu_reaction_type(&reaction.emoji) {
                     if let Some(reaction_id) =
@@ -1798,49 +1786,46 @@ impl ChannelAdapter for FeishuAdapter {
                             .insert(key.clone(), reaction_id);
                     }
                 }
-                self.upsert_status_card(&key, &user.platform_id, reaction)
+                self.append_progress_log(&key, &user.platform_id, "🤔 Thinking...".to_string())
                     .await;
             }
 
-            // ─── Tool execution: text message (Hermes-style chain) ──
             AgentPhase::ToolUse { .. } => {
                 if let Some(detail) = &reaction.detail {
-                    let _ = self
-                        .api_send_message(&user.platform_id, "chat_id", detail)
+                    self.append_progress_log(&key, &user.platform_id, detail.clone())
                         .await;
                 }
             }
 
-            // ─── Streaming: no-op (the final response text is enough) ─
             AgentPhase::Streaming => {}
 
-            // ─── Success: remove reaction, finalize card ────────────
             AgentPhase::Done => {
                 let old_id = self.pending_reactions.lock().unwrap().remove(&key);
                 if let Some(old_id) = old_id {
                     self.api_delete_reaction(message_id, &old_id).await;
                 }
-                let card_id = self.status_cards.lock().unwrap().remove(&key);
-                if let Some(card_id) = card_id {
-                    let card = build_status_card(&reaction.phase, reaction.detail.as_deref());
-                    let _ = self.api_update_card(&card_id, &card).await;
-                }
+                // Append "Done" and then stop tracking (the card stays visible).
+                self.append_progress_log(&key, &user.platform_id, "✅ Done".to_string())
+                    .await;
+                self.progress_msgs.lock().unwrap().remove(&key);
             }
 
-            // ─── Failure: replace with CrossMark, show error ────────
             AgentPhase::Error => {
                 let old_id = self.pending_reactions.lock().unwrap().remove(&key);
                 if let Some(old_id) = old_id {
                     self.api_delete_reaction(message_id, &old_id).await;
                 }
-                // CrossMark is always available — use it directly.
                 self.api_add_reaction(message_id, "CROSS").await;
-                // Update card with error detail, or create one if missing.
-                self.upsert_status_card(&key, &user.platform_id, reaction)
+                let error_line = reaction
+                    .detail
+                    .as_deref()
+                    .map(|d| format!("❌ Error: {d}"))
+                    .unwrap_or_else(|| "❌ Error".to_string());
+                self.append_progress_log(&key, &user.platform_id, error_line)
                     .await;
+                self.progress_msgs.lock().unwrap().remove(&key);
             }
 
-            // ─── Queued: no-op (Thinking fires immediately after) ───
             AgentPhase::Queued => {}
         }
 

@@ -1072,7 +1072,37 @@ impl ChannelBridgeHandle for KernelBridgeAdapter {
     }
 }
 
-/// Format a tool invocation for display (Hermes-style: `tool_name` — "arg").
+/// Map a tool name to a representative emoji (Hermes-style prefix).
+fn tool_emoji(name: &str) -> &'static str {
+    let lower = name.to_lowercase();
+    if lower.contains("shell") || lower.contains("exec") || lower.contains("terminal") || lower.contains("bash") {
+        "💻"
+    } else if lower.contains("search") || lower.contains("grep") || lower.contains("find") || lower.contains("lookup") {
+        "🔎"
+    } else if lower.contains("read") || lower.contains("open") || lower.contains("cat") {
+        "📖"
+    } else if lower.contains("write") || lower.contains("save") || lower.contains("create") || lower.contains("edit") {
+        "✏️"
+    } else if lower.contains("web") || lower.contains("http") || lower.contains("fetch") || lower.contains("curl") {
+        "🌐"
+    } else if lower.contains("code") || lower.contains("python") || lower.contains("run") || lower.contains("exec") {
+        "🐍"
+    } else if lower.contains("file") || lower.contains("list") || lower.contains("ls") || lower.contains("dir") {
+        "📂"
+    } else if lower.contains("browser") || lower.contains("playwright") || lower.contains("selenium") {
+        "🖥️"
+    } else if lower.contains("memory") || lower.contains("recall") || lower.contains("remember") {
+        "🧠"
+    } else if lower.contains("channel") || lower.contains("send") || lower.contains("notify") {
+        "📨"
+    } else if lower.contains("think") || lower.contains("reason") || lower.contains("plan") {
+        "🤔"
+    } else {
+        "🔧"
+    }
+}
+
+/// Format a tool invocation for display (Hermes-style: emoji name: "arg").
 ///
 /// Extracts the most informative field from the tool's input JSON and produces a
 /// one-line summary suitable for a progress text message.
@@ -1101,9 +1131,9 @@ fn fmt_tool_detail(name: &str, input: &serde_json::Value) -> String {
         })
         .unwrap_or_default();
     if preview.is_empty() {
-        format!("`{name}`")
+        format!("{} `{name}`", tool_emoji(name))
     } else {
-        format!("`{name}` ⟶ {preview}")
+        format!("{} `{name}`: {preview}", tool_emoji(name))
     }
 }
 
